@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magika-benchmark"
+version = "0.1.0"
+description = "Benchmark Magika throughput and memory usage on a corpus of files"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "magika==1.0.3",
+]
+
+[project.scripts]
+magika-benchmark = "benchmark_magika:main"
+
+[tool.setuptools]
+py-modules = ["benchmark_magika"]

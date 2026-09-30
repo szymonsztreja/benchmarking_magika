@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Large local artifacts; recreate with the commands in README.md
+dataset/
+wheelhouse/
+
+# macOS
+.DS_Store

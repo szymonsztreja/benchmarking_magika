@@ -1,0 +1,5 @@
+FROM python:3.14-slim
+WORKDIR /work
+COPY . /wheelhouse
+RUN python -m pip install --no-index --find-links=/wheelhouse magika==1.0.3
+ENTRYPOINT ["python"]
