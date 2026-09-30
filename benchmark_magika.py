@@ -322,6 +322,8 @@ def main():
                 f"{label:10s} {file_path}"
             )
     print(f"Most common labels: {label_counts.most_common(10)}")
+    print(f"Files detected as TSV (by content): {label_counts.get('tsv', 0)}")
+    print(f"Files with .tsv extension: {sum(p.suffix.lower() == '.tsv' for p in files)}")
     print(f"All file types: {len(label_counts)}")
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
