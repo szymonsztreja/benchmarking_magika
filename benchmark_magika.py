@@ -6,10 +6,11 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 from statistics import quantiles
+import csv
 
 
 @dataclass
@@ -39,6 +40,17 @@ def parse_args():
         default=100,
         help="Print progress every N files; use 0 to disable (default: 100)",
     )
+    parser.add_argument(
+        "--compare-extensions",
+        action="store_true",
+        help="After the scan, compare predicted labels with file extensions",
+    )
+    parser.add_argument(
+        "--mismatches-csv",
+        type=Path,
+        help="Write extension mismatches to this CSV file (with --compare-extensions)",
+    )
+
     args = parser.parse_args()
     if args.progress_every < 0:
         parser.error("--progress-every must be zero or greater")
@@ -240,6 +252,102 @@ def validate_results(results, expected_count, scan_label):
     return sum(not result.ok for result in results)
 
 
+EXTENSION_OUTCOMES = (
+    "match",
+    "low_confidence",
+    "mismatch",
+    "unknown_extension",
+    "no_extension",
+    "error",
+)
+
+
+@dataclass
+class ExtensionComparison:
+    outcomes: Counter = field(default_factory=Counter)
+    per_extension: dict = field(default_factory=dict)
+    mismatch_pairs: Counter = field(default_factory=Counter)
+    mismatch_rows: list = field(default_factory=list)
+
+
+def count_extension_matches(magika, files, results):
+    # Imported here so the timed `import magika` in main() stays the first one.
+    from magika import OverwriteReason
+
+    # Private attribute: no public API lists the extensions of every content type.
+    # Magika lists a few extensions in uppercase (e.g. CBL, F90, R), so compare lowercase.
+    known_extensions = {
+        extension.lower()
+        for info in magika._cts_infos.values()
+        for extension in info.extensions
+    }
+
+    comparison = ExtensionComparison()
+    for path, result in zip(files, results):
+        extension = path.suffix.lower().lstrip(".")
+        if not result.ok:
+            outcome = "error"
+        elif not extension:
+            outcome = "no_extension"
+        elif extension not in known_extensions:
+            outcome = "unknown_extension"
+        elif extension in {ext.lower() for ext in result.output.extensions}:
+            outcome = "match"
+        elif (
+            result.prediction.overwrite_reason == OverwriteReason.LOW_CONFIDENCE
+            and extension in {ext.lower() for ext in result.dl.extensions}
+        ):
+            outcome = "low_confidence"
+        else:
+            outcome = "mismatch"
+            comparison.mismatch_pairs[(extension, str(result.output.label))] += 1
+            comparison.mismatch_rows.append(
+                (path, extension, result.output.label, result.dl.label, f"{result.score:.3f}")
+            )
+        comparison.outcomes[outcome] += 1
+        key = f".{extension}" if extension else "(none)"
+        comparison.per_extension.setdefault(key, Counter())[outcome] += 1
+    return comparison
+
+
+def print_extension_comparison(comparison, mismatches_csv):
+    outcomes = comparison.outcomes
+    comparable = outcomes["match"] + outcomes["low_confidence"] + outcomes["mismatch"]
+    print("Extension comparison (extension is a weak label, not ground truth):")
+    print(f"  Outcomes: {dict(outcomes)}")
+    if comparable:
+        print(
+            f"  Agreement: {outcomes['match']}/{comparable} "
+            f"= {outcomes['match'] / comparable:.1%}"
+        )
+    rows = [
+        (
+            key,
+            str(sum(counts.values())),
+            *(str(counts[outcome]) for outcome in EXTENSION_OUTCOMES),
+        )
+        for key, counts in sorted(
+            comparison.per_extension.items(), key=lambda item: -sum(item[1].values())
+        )
+    ]
+    print_aligned_table(
+        "Per extension:",
+        ("Extension", "Files", *EXTENSION_OUTCOMES),
+        rows,
+    )
+    print(
+        "Top mismatches (extension -> label): "
+        f"{comparison.mismatch_pairs.most_common(10)}"
+    )
+
+    if mismatches_csv:
+        with mismatches_csv.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("path", "extension", "output_label", "dl_label", "score"))
+            writer.writerows(comparison.mismatch_rows)
+        print(f"Mismatches written to: {mismatches_csv}")
+
+
 def main():
     args = parse_args()
     try:
@@ -325,6 +433,10 @@ def main():
     print(f"Files detected as TSV (by content): {label_counts.get('tsv', 0)}")
     print(f"Files with .tsv extension: {sum(p.suffix.lower() == '.tsv' for p in files)}")
     print(f"All file types: {len(label_counts)}")
+    
+    if args.compare_extensions:
+        comparison = count_extension_matches(magika, files, first_results)
+        print_extension_comparison(comparison, args.mismatches_csv)
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
     print(f"Process CPU time (whole run): {usage.ru_utime + usage.ru_stime:.3f} s")

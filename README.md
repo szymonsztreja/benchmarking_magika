@@ -39,6 +39,8 @@ Useful flags:
 
 - `--mode per-file` or `--mode batch`
 - `--progress-every N` to print progress; use `0` to disable
+- `--compare-extensions` to compare predicted labels with file extensions after the scan
+- `--mismatches-csv FILE` to write those mismatches to a CSV file (with `--compare-extensions`)
 
 ## Offline Linux ARM64 wheelhouse for Docker
 
@@ -104,6 +106,22 @@ docker run --rm \
 
 For a Fargate-shaped task, use `--memory=2g --memory-swap=2g` (1 vCPU requires at least 2 GiB there).
 
+### Match visible CPUs to the CPU limit
+
+`--cpus` limits CPU time, not the CPUs the container can see. onnxruntime sizes its thread pool from the visible CPUs, and Magika 1.0.3 has no option to change it. With 15 visible CPUs (the original Docker Desktop setting on the test machine) and `--cpus=1`, onnxruntime starts 14 worker threads that compete for one CPU's quota, and the container is throttled in every scheduling period.
+
+Before benchmarking, set Docker Desktop → Settings → Resources → Advanced → CPU limit to the same value as `--cpus`, then check:
+
+```zsh
+docker run --rm alpine:3.21 nproc
+```
+
+In the benchmark output, `CPUs visible to process (os.cpu_count)` should match `Container CPU limit (cgroup)`.
+
+- `--cpuset-cpus` does not help: onnxruntime ignores CPU affinity when sizing its pool and logs `pthread_setaffinity_np failed` errors.
+- The Docker Desktop CPU limit applies to all containers until you change it back.
+- To check throttling, add `--name magika-run` to the run and, while it runs, compare `nr_throttled` with `nr_periods` in `docker exec magika-run cat /sys/fs/cgroup/cpu.stat`.
+
 ## Repeated runs with hyperfine
 
 [hyperfine](https://github.com/sharkdp/hyperfine) runs a command several times and reports mean, standard deviation and range. [vmtouch](https://github.com/hoytech/vmtouch) evicts specific files from the macOS file cache without sudo.
@@ -126,21 +144,34 @@ macOS, cold start of a single file (whole process):
 hyperfine --warmup 3 --runs 20 'magika-benchmark sample.py --progress-every 0'
 ```
 
-Docker, cold file cache in the Docker VM before each run, compared across CPU limits:
+Docker, cold file cache in the Docker VM before each run:
 
 ```zsh
 hyperfine --runs 3 \
   --prepare "docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'" \
-  -L cpus 1,2,4 \
-  'docker run --rm --platform linux/arm64 --cpus={cpus} --memory=1g --memory-swap=1g -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/benchmark_magika.py /data --progress-every 0'
+  'docker run --rm --platform linux/arm64 --cpus=1 --memory=1g --memory-swap=1g -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/benchmark_magika.py /data --progress-every 0'
 ```
 
-- hyperfine times the whole process; the script's breakdown (import, init, scan, memory) is hidden unless you add `--show-output`.
-- For Docker commands, hyperfine's `User`/`System` values belong to the `docker` CLI, not the container; use `Time` only.
+To compare CPU limits, set the Docker Desktop CPU limit to each value and rerun with a matching `--cpus`. A single run with `-L cpus 1,2,4` needs a VM with at least 4 CPUs, so the lower limits would measure throttling rather than Magika (see [Match visible CPUs to the CPU limit](#match-visible-cpus-to-the-cpu-limit)). Docker also rejects `--cpus` values above the VM's CPU count.
+
+- hyperfine swallows the command's output by default, so all you get is the timing. `--show-output` prints the script's breakdown (import, init, scan, memory) for every run. Handy for a peek, but the extra printing can nudge the timings, so leave it off for the final numbers.
+- For Docker commands, hyperfine's `User`/`System` values and its memory numbers (`memory_usage_byte` in the hyperfine 1.20 JSON export, ~32 MiB) belong to the `docker` CLI on the host, not to Magika in the container. Take `Time` from hyperfine and RSS from the script's own output.
 - Keep the command in single quotes so `$PWD` is expanded when each run starts.
 - `vmtouch -qe` evicts only the listed paths; the base Python interpreter and system libraries stay cached. Check residency with `vmtouch dataset/thread0`.
 - For bind-mount Docker runs, evict on both sides: prefix the `--prepare` command with `vmtouch -qe dataset/thread0; `.
 - Use `--export-json FILE` or `--export-markdown FILE` to save results.
+
+To keep the timings and every run's script output together, point both at a folder:
+
+```zsh
+mkdir -p benchmark-results
+hyperfine --runs 10 \
+  --export-json benchmark-results/cpu-2.json \
+  --prepare "docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'" \
+  'docker run --rm --platform linux/arm64 --cpus=2 --memory=1g --memory-swap=1g -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/benchmark_magika.py /data --progress-every 0 > "benchmark-results/cpu-2-run-${HYPERFINE_ITERATION}.log" 2>&1'
+```
+
+You end up with `cpu-2.json` plus `cpu-2-run-0.log` to `cpu-2-run-9.log`. Same names on the next run means they get overwritten, so rename (or pick a new folder) if you want to keep the old ones.
 
 ## What was observed
 
@@ -148,8 +179,25 @@ hyperfine --runs 3 \
 - Magika reads only small parts of each file: one cold scan loaded ~79 MB of the 573 MB corpus into the cache, so scan time is dominated by CPU, not disk.
 - The very first runs were slower (~6.5 s). The file cache does not explain this; likely first-run effects (Python bytecode compilation, antivirus scanning of newly extracted files), not confirmed.
 - Background load matters: with Microsoft Defender real-time scanning busy, the same host scan took 10–11 s.
-- Docker, 1 vCPU and 1 GiB limit, corpus on a volume: ~254 s on the first run, ~158 s on later runs.
-- Same limits with a macOS bind mount: ~276–301 s.
+
+Docker, corpus on a volume, 1 GiB memory limit, Docker VM CPU count matched to `--cpus` each time. "Cleared" means `drop_caches` before every run; "warm" means no clearing. hyperfine is the whole `docker run`; "scan" is the script's own full-scan timer averaged over the same runs.
+
+| `--cpus` | Cache | hyperfine (mean ± SD) | Scan |
+|---:|---|---:|---:|
+| 1 | cleared | 8.10 s ± 0.22 s (5 runs) | ~7.8 s |
+| 1 | warm | 7.86 s ± 0.06 s (5 runs) | ~7.6 s |
+| 2 | cleared | 10.49 s ± 0.96 s (10 runs) | ~9.1 s |
+| 4 | cleared | 6.82 s ± 0.11 s (5 runs) | ~6.4 s |
+| 4 | warm | 3.29 s ± 0.06 s (10 runs) | ~3.0 s |
+
+- More CPUs help, but less than you'd hope with a cold cache: 1 → 4 CPUs is only ~1.2x faster. With a warm cache it's ~2.4x.
+- At 1 CPU, clearing the cache barely matters. At 4 CPUs, it roughly doubles the time.
+- 2 CPUs came out slower than 1, and not by fluke: a second 10-run set gave 10.37 s ± 1.36 s. No idea why yet; not investigated.
+- RSS sat at ~75 MiB whatever the CPU count.
+
+- Earlier Docker runs with 15 visible CPUs and `--cpus=1` took ~158–254 s (~200 ms/file). onnxruntime started 14 worker threads, and the container was throttled in every 100 ms period (197 of 197). Forcing one onnxruntime thread in the same setup gave ~7.8 ms/file.
+- A macOS bind mount took ~276–301 s with the same limits. This was measured before the CPU fix and has not been re-measured.
+- The container's cgroup memory (`memory.current`/`peak`) includes the Linux file cache: ~282 MiB after a cold scan and ~43 MiB after a warm one, with the same ~75 MiB RSS. Readahead cached ~160 KiB per file even though Magika reads at most 4 KiB from each end. Use RSS for sizing.
 - The workload was CPU-bound, not memory-bound.
 
 ## Notes
@@ -157,7 +205,8 @@ hyperfine --runs 3 \
 - The benchmark measures throughput and memory; it does not verify prediction correctness.
 - The script includes a separate one-file probe before the main scan, so the reported full-scan timing is after model setup.
 - Magika is content-based; file extension is not the deciding factor.
-- For repeatable results, keep the same image, corpus, CPU limit, and storage path across runs.
+- For repeatable results, keep the same image, corpus, CPU limit, Docker VM CPU count, and storage path across runs.
+- Where a container sees more CPUs than its CPU limit (possible on ECS/Fargate or Kubernetes), onnxruntime oversubscribes the same way. Compare the two CPU lines in the benchmark output. The fix there is setting onnxruntime's `intra_op_num_threads` in code, which Magika 1.0.3 does not expose.
 - Check machine load before benchmarking (`uptime`, `ps -Ao pcpu,comm -r | head -n 4`).
 
 ## References
