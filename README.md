@@ -192,8 +192,8 @@ Docker, corpus on a volume, 1 GiB memory limit, Docker VM CPU count matched to `
 | 4 | warm | 3.45 s ± 0.12 s | ~3.1 s | ~12.5 s | 4.0 |
 
 - Warm cache scales OK-ish: the scan goes 7.7 → 4.6 → 3.1 s, so ~1.7x at 2 CPUs and ~2.5x at 4. Not linear, because total CPU time climbs too (7.7 → 9.2 → 12.5 s); extra cores pay some thread overhead.
-- Cold cache barely matters at 1 CPU (+0.2 s) but roughly doubles the scan at 2 and 4 CPUs. Cores sit partly idle (1.2 of 2, 3.0 of 4) **and** CPU time goes up (12.5 → 19.8 s at 4 CPUs), so it isn't just waiting on disk. A guess: onnxruntime's worker threads spin while the main thread waits for a file read. Not verified.
-- 2 CPUs cold is slower than 1 CPU in all three 10-run sets we have (10.49, 10.37 and 9.56 s) and much noisier. One run in the last set did a 7.0 s scan with 1.4 cores busy, the rest were 8.5–9.1 s at 1.2. Still unexplained.
+- Cold cache barely matters at 1 CPU (+0.2 s) but roughly doubles the scan at 2 and 4 CPUs. Cores sit partly idle (1.2 of 2, 3.0 of 4) **and** CPU time goes up (12.5 → 19.8 s at 4 CPUs). Most of that turned out to be onnxruntime's worker threads spinning while the main thread waits for a file read; the disk itself costs ~0.1 s. About 1.3–1.4 s is still unexplained. See [onnxruntime spinning on vs off](#onnxruntime-spinning-on-vs-off).
+- 2 CPUs cold is slower than 1 CPU in all three 10-run sets we have (10.49, 10.37 and 9.56 s) and much noisier. Spinning is the culprit: with it off, 2 CPUs cold drops to 6.58 s ± 0.19 s, faster than 1 CPU (8.17 s) and way steadier.
 - hyperfine minus scan is ~0.3 s every time: container start, Python import, Magika init.
 - Changing the Docker VM CPU count restarts the VM, so the cache starts empty. The warmup runs of the warm sets looked cold (9.2 s at 2 CPUs, 6.6 s at 4); without `--warmup 1` the first "warm" run would have been a cold one.
 - RSS sat at 74–77 MiB whatever the CPU count or cache state.
@@ -202,6 +202,41 @@ Docker, corpus on a volume, 1 GiB memory limit, Docker VM CPU count matched to `
 - A macOS bind mount took ~276–301 s with the same limits. This was measured before the CPU fix and has not been re-measured.
 - The container's cgroup memory (`memory.current`/`peak`) includes the Linux file cache: ~282 MiB after a cold scan and ~43 MiB after a warm one, with the same ~75 MiB RSS. Readahead cached ~160 KiB per file even though Magika reads at most 4 KiB from each end. Use RSS for sizing.
 - The workload was CPU-bound, not memory-bound.
+
+## onnxruntime spinning on vs off
+
+By default onnxruntime's worker threads spin (busy-wait) between jobs so they can jump on the next one quickly. [spin_probe.py](spin_probe.py) patches Magika's onnxruntime session so you can turn that off (`ORT_SPIN=0`) or set the thread count (`ORT_THREADS=N`), then runs `benchmark_magika.py` as usual. At the end it also prints user vs system CPU and the cgroup throttling counters. Its "Magika import" time looks shorter because onnxruntime is already loaded; the scan numbers aren't affected.
+
+```zsh
+hyperfine --warmup 1 --runs 5 -L spin 1,0 \
+  --export-json benchmark-results/spin-4-cold.json \
+  --prepare "docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'" \
+  'docker run --rm --platform linux/arm64 --cpus=4 --memory=1g --memory-swap=1g -e ORT_SPIN={spin} -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v "$PWD/spin_probe.py:/work/spin_probe.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/spin_probe.py /data --progress-every 0 > "benchmark-results/spin{spin}-4-cold-run-${HYPERFINE_ITERATION}.log" 2>&1'
+```
+
+`-L spin 1,0` runs the benchmark once with each value, swapping it in for `{spin}`. For warm, drop `--prepare` and change `cold` to `warm` in the names. For one thread, use `-e ORT_THREADS=1` instead.
+
+Same setup as the table above, Docker VM CPU count matched, 5 runs each:
+
+| `--cpus` | Cache | onnxruntime | hyperfine (mean ± SD) | Scan | Scan CPU time | Cores busy |
+|---:|---|---|---:|---:|---:|---:|
+| 2 | cold | default (spinning) | 10.21 s ± 1.10 s | ~9.0 s | ~11.0 s | 1.2 |
+| 2 | cold | no spinning | 6.58 s ± 0.19 s | ~6.3 s | ~8.1 s | 1.3 |
+| 2 | warm | default (spinning) | 4.80 s ± 0.07 s | ~4.5 s | ~9.1 s | 2.0 |
+| 2 | warm | no spinning | 5.07 s ± 0.07 s | ~4.8 s | ~8.2 s | 1.7 |
+| 4 | cold | default (spinning) | 6.61 s ± 0.38 s | ~6.3 s | ~19.2 s | 3.0 |
+| 4 | cold | no spinning | 4.97 s ± 0.11 s | ~4.7 s | ~8.6 s | 1.8 |
+| 4 | warm | default (spinning) | 3.29 s ± 0.06 s | ~3.0 s | ~12.0 s | 4.0 |
+| 4 | warm | no spinning | 3.64 s ± 0.05 s | ~3.4 s | ~8.7 s | 2.6 |
+| 4 | cold | 1 thread | 8.13 s ± 0.31 s | ~7.8 s | ~7.7 s | 1.0 |
+| 4 | warm | 1 thread | 8.01 s ± 0.03 s | ~7.7 s | ~7.7 s | 1.0 |
+
+- Cold cache: no spinning is 1.55x faster at 2 CPUs and 1.33x at 4, and burns 26% / 55% less CPU. The extra CPU with spinning is all user time (system CPU stays under ~0.35 s everywhere), so it's the workers busy-waiting, not the kernel reading files.
+- Warm cache: spinning earns its keep a little, 6% faster at 2 CPUs and 10% at 4, for 10% / 38% more CPU.
+- With 1 thread, cold vs warm is only ~0.1 s apart, so the disk itself is cheap.
+- No cold run was throttled. Warm runs with spinning had a few throttled periods (~3–16 ms in total), not enough to matter.
+- Still a mystery: even with spinning off, cold is ~1.4 s slower than warm and cores sit partly idle. Unverified guess: the Docker VM's virtual CPUs go idle while the main thread waits on a read and are slow to wake back up.
+- Takeaway: scanning freshly arrived files is the cold case, and there no spinning wins clearly. Magika 1.0.3 doesn't expose onnxruntime session options, so you'd need a patch like `spin_probe.py`.
 
 ## Notes
 
