@@ -165,13 +165,13 @@ To keep the timings and every run's script output together, point both at a fold
 
 ```zsh
 mkdir -p benchmark-results
-hyperfine --runs 10 \
-  --export-json benchmark-results/cpu-2.json \
+hyperfine --warmup 1 --runs 10 \
+  --export-json benchmark-results/cpu-2-cold.json \
   --prepare "docker run --rm --privileged alpine:3.21 sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'" \
-  'docker run --rm --platform linux/arm64 --cpus=2 --memory=1g --memory-swap=1g -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/benchmark_magika.py /data --progress-every 0 > "benchmark-results/cpu-2-run-${HYPERFINE_ITERATION}.log" 2>&1'
+  'docker run --rm --platform linux/arm64 --cpus=2 --memory=1g --memory-swap=1g -v "$PWD/benchmark_magika.py:/work/benchmark_magika.py:ro" -v magika-corpus-bench:/data:ro magika-bench /work/benchmark_magika.py /data --progress-every 0 > "benchmark-results/cpu-2-cold-run-${HYPERFINE_ITERATION}.log" 2>&1'
 ```
 
-You end up with `cpu-2.json` plus `cpu-2-run-0.log` to `cpu-2-run-9.log`. Same names on the next run means they get overwritten, so rename (or pick a new folder) if you want to keep the old ones.
+You end up with `cpu-2-cold.json`, `cpu-2-cold-run-0.log` to `cpu-2-cold-run-9.log`, and `cpu-2-cold-run-warmup-0.log` from the warmup. For a warm run, drop the `--prepare` line and swap `cold` for `warm` in the names. Same names on the next run means they get overwritten, so rename (or pick a new folder) if you want to keep the old ones.
 
 ## What was observed
 
@@ -180,20 +180,23 @@ You end up with `cpu-2.json` plus `cpu-2-run-0.log` to `cpu-2-run-9.log`. Same n
 - The very first runs were slower (~6.5 s). The file cache does not explain this; likely first-run effects (Python bytecode compilation, antivirus scanning of newly extracted files), not confirmed.
 - Background load matters: with Microsoft Defender real-time scanning busy, the same host scan took 10–11 s.
 
-Docker, corpus on a volume, 1 GiB memory limit, Docker VM CPU count matched to `--cpus` each time. "Cleared" means `drop_caches` before every run; "warm" means no clearing. hyperfine is the whole `docker run`; "scan" is the script's own full-scan timer averaged over the same runs.
+Docker, corpus on a volume, 1 GiB memory limit, Docker VM CPU count matched to `--cpus` each time, `--warmup 1 --runs 10`. "Cold" means `drop_caches` before every run; "warm" means no clearing. hyperfine is the whole `docker run`; "scan" and "cores busy" come from the script's own output, averaged over the 10 runs. Raw JSON and logs are in `benchmark-results/cpu-N-{cold,warm}*`.
 
-| `--cpus` | Cache | hyperfine (mean ± SD) | Scan |
-|---:|---|---:|---:|
-| 1 | cleared | 8.10 s ± 0.22 s (5 runs) | ~7.8 s |
-| 1 | warm | 7.86 s ± 0.06 s (5 runs) | ~7.6 s |
-| 2 | cleared | 10.49 s ± 0.96 s (10 runs) | ~9.1 s |
-| 4 | cleared | 6.82 s ± 0.11 s (5 runs) | ~6.4 s |
-| 4 | warm | 3.29 s ± 0.06 s (10 runs) | ~3.0 s |
+| `--cpus` | Cache | hyperfine (mean ± SD) | Scan | Scan CPU time | Cores busy |
+|---:|---|---:|---:|---:|---:|
+| 1 | cold | 8.17 s ± 0.17 s | ~7.9 s | ~7.8 s | 1.0 |
+| 1 | warm | 7.96 s ± 0.10 s | ~7.7 s | ~7.7 s | 1.0 |
+| 2 | cold | 9.56 s ± 1.32 s | ~8.7 s | ~10.5 s | 1.2 |
+| 2 | warm | 4.86 s ± 0.08 s | ~4.6 s | ~9.2 s | 2.0 |
+| 4 | cold | 6.88 s ± 0.08 s | ~6.5 s | ~19.8 s | 3.0 |
+| 4 | warm | 3.45 s ± 0.12 s | ~3.1 s | ~12.5 s | 4.0 |
 
-- More CPUs help, but less than you'd hope with a cold cache: 1 → 4 CPUs is only ~1.2x faster. With a warm cache it's ~2.4x.
-- At 1 CPU, clearing the cache barely matters. At 4 CPUs, it roughly doubles the time.
-- 2 CPUs came out slower than 1, and not by fluke: a second 10-run set gave 10.37 s ± 1.36 s. No idea why yet; not investigated.
-- RSS sat at ~75 MiB whatever the CPU count.
+- Warm cache scales OK-ish: the scan goes 7.7 → 4.6 → 3.1 s, so ~1.7x at 2 CPUs and ~2.5x at 4. Not linear, because total CPU time climbs too (7.7 → 9.2 → 12.5 s); extra cores pay some thread overhead.
+- Cold cache barely matters at 1 CPU (+0.2 s) but roughly doubles the scan at 2 and 4 CPUs. Cores sit partly idle (1.2 of 2, 3.0 of 4) **and** CPU time goes up (12.5 → 19.8 s at 4 CPUs), so it isn't just waiting on disk. A guess: onnxruntime's worker threads spin while the main thread waits for a file read. Not verified.
+- 2 CPUs cold is slower than 1 CPU in all three 10-run sets we have (10.49, 10.37 and 9.56 s) and much noisier. One run in the last set did a 7.0 s scan with 1.4 cores busy, the rest were 8.5–9.1 s at 1.2. Still unexplained.
+- hyperfine minus scan is ~0.3 s every time: container start, Python import, Magika init.
+- Changing the Docker VM CPU count restarts the VM, so the cache starts empty. The warmup runs of the warm sets looked cold (9.2 s at 2 CPUs, 6.6 s at 4); without `--warmup 1` the first "warm" run would have been a cold one.
+- RSS sat at 74–77 MiB whatever the CPU count or cache state.
 
 - Earlier Docker runs with 15 visible CPUs and `--cpus=1` took ~158–254 s (~200 ms/file). onnxruntime started 14 worker threads, and the container was throttled in every 100 ms period (197 of 197). Forcing one onnxruntime thread in the same setup gave ~7.8 ms/file.
 - A macOS bind mount took ~276–301 s with the same limits. This was measured before the CPU fix and has not been re-measured.
